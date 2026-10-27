@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { getChatGPTUser } from '../../chatgpt-auth';
 import { z } from 'zod';
+import {isPlatformOwner,boostState,saveFeatured,createBoostCheckout,createBillingPortal,handleBillingWebhook,ownerOverview,grantComplimentary,revokeComplimentary,clearBillingHold} from '../../../lib/boost-billing';
 export const dynamic='force-dynamic';
 const categories=['Textbooks','Lab coats & gear','Dorm & living','Electronics','Other'] as const;
 const profileSchema=z.object({name:z.string().trim().min(2).max(60),school:z.string().trim().min(2).max(100),city:z.string().trim().min(2).max(80),zip:z.string().regex(/^\d{5}$/),schoolType:z.enum(['College / university','High school'])});
@@ -12,16 +13,30 @@ async function row(sql:string,...args:unknown[]){return db().prepare(sql).bind(.
 async function rows(sql:string,...args:unknown[]){return (await db().prepare(sql).bind(...args).all<any>()).results}
 async function run(sql:string,...args:unknown[]){return db().prepare(sql).bind(...args).run()}
 async function handle(req:Request){
- const url=new URL(req.url);const p=url.pathname.replace(/^\/api\/?/,'').split('/').filter(Boolean); const method=req.method;const user=await getChatGPTUser();const uid=user?.userId;
+ const url=new URL(req.url);const p=url.pathname.replace(/^\/api\/?/,'').split('/').filter(Boolean); const method=req.method;
+ if(p[0]==='billing'&&p[1]==='webhook'&&method==='POST')return json(await handleBillingWebhook(req));
+ const user=await getChatGPTUser();const uid=user?.userId;
  if(method!=='GET') {if(!uid)fail('Sign in to continue.',401);const origin=req.headers.get('origin');if(origin&&new URL(origin).origin!==url.origin)fail('Request origin does not match.',403);}
- if(p[0]==='me'&&method==='GET')return json({user:user?{id:uid,name:user.fullName||user.email.split('@')[0]}:null,profile:uid?await row('SELECT * FROM profiles WHERE id=?',uid):null});
+ if(p[0]==='me'&&method==='GET')return json({isOwner:isPlatformOwner(user),user:user?{id:uid,name:user.fullName||user.email.split('@')[0]}:null,profile:uid?await row('SELECT * FROM profiles WHERE id=?',uid):null});
+ if(p[0]==='boosts'){
+  if(method==='GET')return json(await boostState(uid));
+  if(method==='POST'){const b=z.object({listingIds:z.array(z.string().uuid()).max(3)}).parse(await req.json());await saveFeatured(uid!,b.listingIds);return json({ok:true});}
+ }
+ if(p[0]==='billing'&&p[1]==='checkout'&&method==='POST')return json(await createBoostCheckout(user!));
+ if(p[0]==='billing'&&p[1]==='portal'&&method==='POST')return json(await createBillingPortal(uid!));
+ if(p[0]==='owner'){
+  if(!isPlatformOwner(user))fail('Website owner access is required.',403);
+  if(method==='GET'&&p[1]==='overview')return json(await ownerOverview());
+  if(method==='POST'&&p[1]==='complimentary'){const b=z.object({userId:z.string().min(1).max(200),action:z.enum(['grant','revoke'])}).parse(await req.json());if(b.action==='grant')await grantComplimentary(b.userId);else await revokeComplimentary(b.userId);return json({ok:true});}
+  if(method==='POST'&&p[1]==='clear-hold'){const b=z.object({userId:z.string().min(1).max(200)}).parse(await req.json());await clearBillingHold(b.userId);return json({ok:true});}
+ }
  if(p[0]==='profile'&&method==='POST'){const b=profileSchema.parse(await req.json());await run('INSERT INTO profiles (id,name,school,city,zip,school_type) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,school=excluded.school,city=excluded.city,zip=excluded.zip,school_type=excluded.school_type',uid,b.name,b.school,b.city,b.zip,b.schoolType);return json({ok:true})}
  if(p[0]==='listings'&&method==='GET') {let filters=['1=1'];let vals:unknown[]=[];const add=(sql:string,...v:unknown[])=>{filters.push(sql);vals.push(...v)};
   if(url.searchParams.get('mine')==='1'){if(!uid)fail('Sign in to see your listings.',401);add('l.owner_id=?',uid)}else add("l.status='available'");
   const q=url.searchParams.get('q')?.slice(0,100);if(q)add('(l.title LIKE ? OR l.description LIKE ?)',`%${q}%`,`%${q}%`);
   const school=url.searchParams.get('school')?.trim();if(school)add('l.school LIKE ?',`%${school.slice(0,100)}%`);
   const area=url.searchParams.get('area')?.trim();if(area)add('(l.zip LIKE ? OR l.city LIKE ?)',`${area.slice(0,80)}%`,`%${area.slice(0,80)}%`);
-  return json({listings:await rows(`SELECT l.*, COALESCE(p.name,'Student') seller_name FROM listings l LEFT JOIN profiles p ON p.id=l.owner_id WHERE ${filters.join(' AND ')} ORDER BY l.created_at DESC LIMIT 500`,...vals)});
+  return json({listings:await rows(`SELECT l.*, COALESCE(p.name,'Student') seller_name, CASE WHEN EXISTS (SELECT 1 FROM featured_listings f JOIN subscriptions s ON s.user_id=f.user_id WHERE f.listing_id=l.id AND f.user_id=l.owner_id AND s.status='active' AND s.current_period_end>? AND s.risk_hold=0) THEN 1 ELSE 0 END promoted FROM listings l LEFT JOIN profiles p ON p.id=l.owner_id WHERE ${filters.join(' AND ')} ORDER BY promoted DESC,l.created_at DESC LIMIT 500`,Date.now(),...vals)});
  }
  if(p[0]==='listings'&&method==='POST'){const b=listingSchema.parse(await req.json());const profile=await row('SELECT * FROM profiles WHERE id=?',uid);if(!profile)fail('Add your school and pickup area first.');if(b.image){const img=await env.BUCKET?.head(b.image);if(img?.customMetadata?.owner!==uid)fail('Choose an image you uploaded.');}const id=crypto.randomUUID();await run('INSERT INTO listings (id,owner_id,title,description,category,condition,mode,price,trade_for,image,school,city,zip,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id,uid,b.title,b.description,b.category,b.condition,b.mode,b.mode==='free'?0:b.price,b.tradeFor,b.image,profile.school,profile.city,profile.zip,'available',Date.now());return json({id},201)}
  if(p[0]==='listings'&&p[1]&&method==='PATCH'){const listing=await row('SELECT * FROM listings WHERE id=?',p[1]);if(!listing||listing.owner_id!==uid)fail('Listing not found.',404);const b=z.object({status:z.enum(['available','reserved','sold'])}).parse(await req.json());await run('UPDATE listings SET status=? WHERE id=? AND owner_id=?',b.status,p[1],uid);return json({ok:true})}
